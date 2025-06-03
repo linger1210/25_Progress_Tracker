@@ -46,6 +46,11 @@ const authorizeDepartment = (...departments) => {
       return res.status(401).json({ error: 'Authentication required' });
     }
     
+    // Management department has access to all routes
+    if (req.user.department === 'Management' || req.user.role === 'admin') {
+      return next();
+    }
+    
     if (!departments.includes(req.user.department)) {
       return res.status(403).json({ error: 'Access denied for your department' });
     }

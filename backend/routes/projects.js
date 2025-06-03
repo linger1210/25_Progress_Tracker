@@ -25,10 +25,10 @@ router.get('/', auth, async (req, res) => {
       .populate('createdBy', 'username department')
       .sort('-createdAt');
 
-    // Filter amount field based on role
+    // Filter amount field based on role - Sales can see amounts in their own projects
     const projectsData = projects.map(project => {
       const projectObj = project.toObject();
-      if (req.user.role !== 'admin') {
+      if (req.user.role !== 'admin' && req.user.department !== 'Sales' && req.user.department !== 'Management') {
         delete projectObj.amount;
       }
       return projectObj;
@@ -87,10 +87,11 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(404).json({ error: 'Project not found' });
     }
 
-    // Check permissions based on department and current stage
+    // Check permissions based on department and role
     const canEdit = 
       req.user.role === 'admin' ||
-      (req.user.department === 'Sales' && project.currentStage === 'Sales') ||
+      req.user.department === 'Management' ||
+      (req.user.department === 'Sales' && project.createdBy.toString() === req.user._id.toString()) ||
       (req.user.department === project.currentStage);
 
     if (!canEdit) {
@@ -99,9 +100,20 @@ router.put('/:id', auth, async (req, res) => {
 
     const updates = req.body;
     
-    // Prevent non-admin users from updating amount
-    if (req.user.role !== 'admin') {
+    // Sales users can edit projectName, estimatedCompletionDate, and amount of their own projects
+    // Other departments cannot edit amount unless admin/management
+    if (req.user.role !== 'admin' && req.user.department !== 'Management' && req.user.department !== 'Sales') {
       delete updates.amount;
+    }
+
+    // Restrict what Sales can edit to basic project info
+    if (req.user.department === 'Sales' && req.user.role !== 'admin') {
+      const allowedUpdates = ['projectName', 'estimatedCompletionDate', 'amount'];
+      Object.keys(updates).forEach(key => {
+        if (!allowedUpdates.includes(key)) {
+          delete updates[key];
+        }
+      });
     }
 
     Object.keys(updates).forEach(key => {
@@ -137,21 +149,40 @@ router.post('/:id/dne-update', [
       return res.status(400).json({ error: 'Project is not in DNE stage' });
     }
 
+    const previousStatus = project.stages.dne.status;
     project.stages.dne.status = status;
     project.stages.dne.completedBy = req.user._id;
 
     if (status === 'partial_completed') {
       project.stages.dne.partialCompletedAt = new Date();
-      // Create default milestones when moving to production
-      await createDefaultMilestones(project._id);
-    } else if (status === 'completed') {
-      project.stages.dne.completedAt = new Date();
+      
+      // Flow to Production on partial completion
       project.currentStage = 'Production';
       project.stages.production.status = 'in_progress';
-      // Create default milestones if not already created
+      
+      // Create default milestones when first moving to production
       const existingMilestones = await Milestone.find({ project: project._id });
       if (existingMilestones.length === 0) {
         await createDefaultMilestones(project._id);
+      }
+      
+    } else if (status === 'completed') {
+      project.stages.dne.completedAt = new Date();
+      
+      // If already in production (from partial_completed), don't change stage
+      if (previousStatus === 'partial_completed') {
+        // Just update DNE status, keep in Production stage
+        // Don't create new milestones as they already exist
+      } else {
+        // If coming directly from pending to completed
+        project.currentStage = 'Production';
+        project.stages.production.status = 'in_progress';
+        
+        // Create default milestones if not already created
+        const existingMilestones = await Milestone.find({ project: project._id });
+        if (existingMilestones.length === 0) {
+          await createDefaultMilestones(project._id);
+        }
       }
     }
 
@@ -179,14 +210,53 @@ router.post('/:id/production-update', [
       return res.status(400).json({ error: 'Project is not in Production stage' });
     }
 
+    // Check if all milestones are completed before allowing submission
+    const milestones = await Milestone.find({ project: project._id });
+    const allMilestonesCompleted = milestones.length > 0 && milestones.every(m => m.status === 'completed');
+
+    if (!allMilestonesCompleted) {
+      return res.status(400).json({ error: 'All milestones must be completed before submitting' });
+    }
+
     project.stages.production.status = 'completed';
     project.stages.production.completedAt = new Date();
     project.stages.production.completedBy = req.user._id;
+    
+    // Always move to Installation when production is submitted
     project.currentStage = 'Installation';
     project.stages.installation.status = 'in_progress';
 
     await project.save();
     res.json(project);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get projects by stage with DNE status for Production view
+router.get('/production-projects', [
+  auth,
+  authorizeDepartment('Production')
+], async (req, res) => {
+  try {
+    const projects = await Project.find({ 
+      currentStage: 'Production',
+      isDeleted: false 
+    })
+    .populate('createdBy', 'username department')
+    .populate('stages.dne.completedBy', 'username')
+    .populate('stages.production.completedBy', 'username')
+    .sort('-createdAt');
+
+    // Add DNE status to each project for Production team reference
+    const projectsWithDneStatus = projects.map(project => {
+      const projectObj = project.toObject();
+      projectObj.dneStatus = project.stages.dne.status; // partial_completed or completed
+      return projectObj;
+    });
+
+    res.json(projectsWithDneStatus);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error' });
@@ -232,5 +302,82 @@ async function createDefaultMilestones(projectId) {
     });
   }
 }
+
+// Get completed projects for history (all departments can access)
+router.get('/history', auth, async (req, res) => {
+  try {
+    let query = { isDeleted: false };
+    
+    // For Sales department, show their submitted projects
+    if (req.user.department === 'Sales') {
+      query.createdBy = req.user._id;
+    }
+    // For DNE department, show projects they completed
+    else if (req.user.department === 'DNE') {
+      query['stages.dne.status'] = 'completed';
+    }
+    // For Production department, show projects they completed
+    else if (req.user.department === 'Production') {
+      query['stages.production.status'] = 'completed';
+    }
+    // For Installation department, show projects they completed
+    else if (req.user.department === 'Installation') {
+      query['stages.installation.status'] = 'completed';
+    }
+    // For Management, show all projects
+    // (no additional filter needed)
+
+    const projects = await Project.find(query)
+      .populate('createdBy', 'username department')
+      .populate('stages.dne.completedBy', 'username')
+      .populate('stages.production.completedBy', 'username')
+      .populate('stages.installation.completedBy', 'username')
+      .sort('-updatedAt');
+
+    // Filter amount field based on role - Sales and Management can see amounts
+    const projectsData = projects.map(project => {
+      const projectObj = project.toObject();
+      if (req.user.role !== 'admin' && req.user.department !== 'Sales' && req.user.department !== 'Management') {
+        delete projectObj.amount;
+      }
+      return projectObj;
+    });
+
+    res.json(projectsData);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get projects for DNE department with different statuses
+router.get('/dne-projects', [
+  auth,
+  authorizeDepartment('DNE')
+], async (req, res) => {
+  try {
+    const { status } = req.query; // 'wip' or 'history'
+    
+    let query = { isDeleted: false };
+    
+    if (status === 'wip') {
+      // Show projects currently in DNE stage
+      query.currentStage = 'DNE';
+    } else if (status === 'history') {
+      // Show projects that DNE has completed
+      query['stages.dne.status'] = { $in: ['partial_completed', 'completed'] };
+    }
+
+    const projects = await Project.find(query)
+      .populate('createdBy', 'username department')
+      .populate('stages.dne.completedBy', 'username')
+      .sort('-updatedAt');
+
+    res.json(projects);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 module.exports = router; 

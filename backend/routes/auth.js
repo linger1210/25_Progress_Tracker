@@ -19,6 +19,14 @@ router.post('/register', [
 
     const { username, password, department, role } = req.body;
 
+    // Restrict Management department to specific usernames
+    if (department === 'Management') {
+      const allowedManagementUsers = ['MansteelAdmin1', 'MansteelAdmin2', 'MansteelAdmin3'];
+      if (!allowedManagementUsers.includes(username)) {
+        return res.status(403).json({ error: 'Access denied: Only authorized personnel can register for Management department' });
+      }
+    }
+
     // Check if user exists
     const existingUser = await User.findOne({ username });
     if (existingUser) {
@@ -30,7 +38,7 @@ router.post('/register', [
       username,
       password,
       department,
-      role: role || 'viewer'
+      role: department === 'Management' ? 'admin' : (role || 'viewer')
     });
 
     await user.save();
